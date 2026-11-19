@@ -1,0 +1,166 @@
+name: Build AAPSClient iOS on cloud mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "哪个 App"
+        required: true
+        default: AAPSClient
+        type: choice
+        options: [AAPSClient, AAPSClient2]
+      mode:
+        description: "unsigned 出未签名 ipa / signed 用 Secrets 证书签名"
+        required: true
+        default: unsigned
+        type: choice
+        options: [unsigned, signed]
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned:
+    if: inputs.mode == 'unsigned'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: 拉取 AndroidAPS 4.0.0 源码
+        uses: actions/checkout@v4
+        with:
+          repository: nightscout/AndroidAPS
+          ref: 4.0.0
+          path: AndroidAPS
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 让 java_home 认识 JDK 21
+        run: |
+          sudo mkdir -p /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents
+          sudo ln -sfn "$JAVA_HOME" /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
+          /usr/libexec/java_home -v 21
+
+      - name: 准备 Android SDK 与工具链
+        run: |
+          set -euxo pipefail
+          for d in "$HOME/Library/Android/sdk" "/Users/runner/Library/Android/sdk" "$ANDROID_HOME"; do
+            if [ -d "$d" ]; then echo "ANDROID_HOME=$d" >> "$GITHUB_ENV"; echo "使用 SDK: $d"; break; fi
+          done
+          xcodebuild -version
+          java -version
+
+      - name: Archive（关闭签名）
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project AndroidAPS/ios/app/AAPSClient.xcodeproj \
+            -scheme "${{ inputs.target }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "build/${{ inputs.target }}.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: 打包 ipa
+        run: |
+          set -euxo pipefail
+          mkdir -p build/Payload
+          cp -R "build/${{ inputs.target }}.xcarchive/Products/Applications/${{ inputs.target }}.app" build/Payload/
+          cd build && zip -qry "${{ inputs.target }}-unsigned.ipa" Payload
+          ls -lh "${{ inputs.target }}-unsigned.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target }}-unsigned-ipa
+          path: build/${{ inputs.target }}-unsigned.ipa
+          if-no-files-found: error
+
+  signed:
+    if: inputs.mode == 'signed'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: 拉取 AndroidAPS 4.0.0 源码
+        uses: actions/checkout@v4
+        with:
+          repository: nightscout/AndroidAPS
+          ref: 4.0.0
+          path: AndroidAPS
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 让 java_home 认识 JDK 21
+        run: |
+          sudo mkdir -p /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents
+          sudo ln -sfn "$JAVA_HOME" /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
+
+      - name: 导入证书与描述文件
+        env:
+          CERT_P12: ${{ secrets.BUILD_CERT_P12_BASE64 }}
+          CERT_PASS: ${{ secrets.BUILD_CERT_P12_PASSWORD }}
+          PROFILE: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          TEAM: ${{ secrets.TEAM_ID }}
+          KEYCHAIN_PASS: tempkeychain
+        run: |
+          set -euo pipefail
+          echo -n "$CERT_P12" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          echo -n "$PROFILE" | base64 --decode -o "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/k.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/k.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$RUNNER_TEMP/k.keychain-db"
+          security import "$RUNNER_TEMP/cert.p12" -k "$RUNNER_TEMP/k.keychain-db" -P "$CERT_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$RUNNER_TEMP/k.keychain-db"
+          security list-keychain -d user -s "$RUNNER_TEMP/k.keychain-db"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/profile.mobileprovision"
+          printf 'DEVELOPMENT_TEAM = %s\n' "$TEAM" > AndroidAPS/ios/app/Signing.local.xcconfig
+          security find-identity -v -p codesigning
+
+      - name: Archive（签名）
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project AndroidAPS/ios/app/AAPSClient.xcodeproj \
+            -scheme "${{ inputs.target }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "build/${{ inputs.target }}.xcarchive" \
+            -allowProvisioningUpdates \
+            archive
+
+      - name: 导出 ipa
+        env:
+          TEAM: ${{ secrets.TEAM_ID }}
+        run: |
+          set -euxo pipefail
+          mkdir -p build/ipa
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict>' \
+            '<key>method</key><string>development</string>' \
+            '<key>signingStyle</key><string>automatic</string>' \
+            "<key>teamID</key><string>$TEAM</string>" \
+            '<key>stripSwiftSymbols</key><true/>' \
+            '</dict></plist>' > build/ExportOptions.plist
+          xcodebuild -exportArchive \
+            -archivePath "build/${{ inputs.target }}.xcarchive" \
+            -exportPath build/ipa \
+            -exportOptionsPlist build/ExportOptions.plist \
+            -allowProvisioningUpdates
+          ls -lh build/ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.target }}-signed-ipa
+          path: build/ipa/*.ipa
+          if-no-files-found: error
