@@ -15,6 +15,12 @@ on:
         default: unsigned
         type: choice
         options: [unsigned, signed]
+      configuration:
+        description: "Release 慢但体积小；Debug 快、体积大，测试够用"
+        required: true
+        default: Debug
+        type: choice
+        options: [Debug, Release]
 
 permissions:
   contents: read
@@ -53,13 +59,24 @@ jobs:
           xcodebuild -version
           java -version
 
-      - name: Archive（关闭签名）
+      - name: 缓存 Gradle 与 Kotlin/Native 工具链
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.konan
+          key: gradle-konan-${{ runner.os }}-${{ inputs.configuration }}-${{ hashFiles('AndroidAPS/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-konan-${{ runner.os }}-${{ inputs.configuration }}-
+
+      - name: Archive（关闭签名，${{ inputs.configuration }}）
         run: |
           set -euxo pipefail
           xcodebuild \
             -project AndroidAPS/ios/app/AAPSClient.xcodeproj \
             -scheme "${{ inputs.target }}" \
-            -configuration Release \
+            -configuration "${{ inputs.configuration }}" \
             -destination 'generic/platform=iOS' \
             -archivePath "build/${{ inputs.target }}.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
@@ -72,13 +89,13 @@ jobs:
           set -euxo pipefail
           mkdir -p build/Payload
           cp -R "build/${{ inputs.target }}.xcarchive/Products/Applications/${{ inputs.target }}.app" build/Payload/
-          cd build && zip -qry "${{ inputs.target }}-unsigned.ipa" Payload
-          ls -lh "${{ inputs.target }}-unsigned.ipa"
+          cd build && zip -qry "${{ inputs.target }}-${{ inputs.configuration }}-unsigned.ipa" Payload
+          ls -lh "${{ inputs.target }}-${{ inputs.configuration }}-unsigned.ipa"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.target }}-unsigned-ipa
-          path: build/${{ inputs.target }}-unsigned.ipa
+          name: ${{ inputs.target }}-${{ inputs.configuration }}-unsigned-ipa
+          path: build/${{ inputs.target }}-${{ inputs.configuration }}-unsigned.ipa
           if-no-files-found: error
 
   signed:
@@ -104,6 +121,17 @@ jobs:
           sudo mkdir -p /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents
           sudo ln -sfn "$JAVA_HOME" /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
 
+      - name: 缓存 Gradle 与 Kotlin/Native 工具链
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.konan
+          key: gradle-konan-${{ runner.os }}-${{ inputs.configuration }}-${{ hashFiles('AndroidAPS/gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-konan-${{ runner.os }}-${{ inputs.configuration }}-
+
       - name: 导入证书与描述文件
         env:
           CERT_P12: ${{ secrets.BUILD_CERT_P12_BASE64 }}
@@ -126,13 +154,13 @@ jobs:
           printf 'DEVELOPMENT_TEAM = %s\n' "$TEAM" > AndroidAPS/ios/app/Signing.local.xcconfig
           security find-identity -v -p codesigning
 
-      - name: Archive（签名）
+      - name: Archive（签名，${{ inputs.configuration }}）
         run: |
           set -euxo pipefail
           xcodebuild \
             -project AndroidAPS/ios/app/AAPSClient.xcodeproj \
             -scheme "${{ inputs.target }}" \
-            -configuration Release \
+            -configuration "${{ inputs.configuration }}" \
             -destination 'generic/platform=iOS' \
             -archivePath "build/${{ inputs.target }}.xcarchive" \
             -allowProvisioningUpdates \
@@ -161,6 +189,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.target }}-signed-ipa
+          name: ${{ inputs.target }}-${{ inputs.configuration }}-signed-ipa
           path: build/ipa/*.ipa
           if-no-files-found: error
